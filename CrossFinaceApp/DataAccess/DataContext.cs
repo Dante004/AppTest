@@ -7,7 +7,7 @@ namespace CrossFinaceApp.DataAccess
     {
         public DataContext(DbContextOptions options) : base (options)
         {
-
+            Database.Migrate();
         }
 
         public DbSet<Person> People { get; set; }

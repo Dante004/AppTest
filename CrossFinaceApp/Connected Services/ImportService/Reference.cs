@@ -420,6 +420,7 @@ namespace ImportService
     [System.Runtime.Serialization.DataContractAttribute(Name="Phone", Namespace="http://schemas.datacontract.org/2004/07/ImportService")]
     public partial class Phone : object
     {
+        public string Phone1 { get; set; }
     }
     
     [System.CodeDom.Compiler.GeneratedCodeAttribute("Microsoft.Tools.ServiceModel.Svcutil", "2.0.2")]

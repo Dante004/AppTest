@@ -1,4 +1,4 @@
-﻿using System;
+﻿using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -7,6 +7,8 @@ using CrossFinaceApp.Helpers;
 using CrossFinaceApp.Models;
 using ExcelDataReader;
 using FluentValidation;
+using FluentValidation.Results;
+using Mapster;
 using MediatR;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
@@ -66,7 +68,13 @@ namespace CrossFinaceApp.Controlers.DebtPortfolios
 
             public async Task<Result> Handle(ImportDataFromFileCommand request, CancellationToken cancellationToken)
             {
-                System.Text.Encoding.RegisterProvider(System.Text.CodePagesEncodingProvider.Instance);
+                if(request.File == null)
+                {
+                    return Result.Error("You have to send file to run this handler");
+                }
+
+                var validatorError = new List<ValidationFailure>();
+
                 using (var reader = ExcelReaderFactory.CreateReader(request.File.OpenReadStream()))
                 { 
                     while(reader.Read())
@@ -77,82 +85,48 @@ namespace CrossFinaceApp.Controlers.DebtPortfolios
                             continue;
                         }
 
-                        var address = new Address
-                        {
-                            StreetName = reader.GetValue(5) as string,
-                            StreetNumber = reader.GetValue(6) as string,
-                            FlatNumber = reader.GetValue(7) as string,
-                            PostCode = reader.GetValue(8) as string,
-                            PostOfficeCity = reader.GetValue(9) as string,
-                            CorrespondenceStreetName = reader.GetValue(10) as string,
-                            CorrespondenceStreetnumber = reader.GetValue(11) as string,
-                            CorrespondenceFlatNumber = reader.GetValue(12) as string,
-                            CorrespondencePostCode = reader.GetValue(13) as string,
-                            CorrespondencePostOfficeCity = reader.GetValue(14) as string
-                        };
-
+                        var address = reader.MapAddress();
                         await _dataContext.Addresses.AddAsync(address);
 
-                        var person = new Person
-                        {
-                            FirstName = reader.GetValue(2) as string,
-                            Surname = reader.GetValue(3) as string,
-                            Address = address,
-                            NationalIdentificationNumber = reader.GetValue(4).ToString() ?? "",
-                            PhoneNumber = reader.GetValue(15).ToString() ?? "",
-                            PhoneNumber2 = reader.GetValue(16).ToString() ?? ""
-                        };
+                        var person = reader.MapPerson(address);
 
                         var validationResult = await _validator.ValidateAsync(person);
 
                         if(!validationResult.IsValid)
                         {
-                            return Result.Error(validationResult.Errors);
+                            validatorError.AddRange(validationResult.Errors);
                         }
 
                         await _dataContext.People.AddAsync(person);
 
-                        var financialState = new FinancialState
-                        {
-                            OutstandingLiabilites = Convert.ToDecimal(reader.GetValue(17)),
-                            Interests = Convert.ToDecimal(reader.GetValue(18)),
-                            PenaltyInterests = Convert.ToDecimal(reader.GetValue(19)),
-                            Fees = Convert.ToDecimal(reader.GetValue(20)),
-                            CourtFees = Convert.ToDecimal(reader.GetValue(21)),
-                            RepresentationCourtFees = Convert.ToDecimal(reader.GetValue(22)),
-                            VindicationCosts = Convert.ToDecimal(reader.GetValue(23)),
-                            RepresentationVindicationCosts = Convert.ToDecimal(reader.GetValue(24))
-                        };
-
+                        var financialState = reader.MapFinancialState();
                         await _dataContext.FinancialStates.AddAsync(financialState);
 
-                        var agreement = new Agreement
-                        {
-                            Number = reader.GetValue(1).ToString() ?? "",
-                            Person = person,
-                            FinancialState = financialState
-                        };
-
+                        var agreement = reader.MapAgreement(person, financialState);
                         await _dataContext.Agreements.AddAsync(agreement);
                     }
-
+                    if(validatorError.Any())
+                    {
+                        return Result.Error(validatorError);
+                    }
                     await _dataContext.SaveChangesAsync();
                 }
-
                 return Result.Ok();
             }
         }
 
         public class PersonValidator : AbstractValidator<Person>
         {
+            private static int[] multipliers = new int[] { 1, 3, 7, 9, 1, 3, 7, 9, 1, 3 };
+
             public PersonValidator()
             {
                 RuleFor(p => p.NationalIdentificationNumber)
                     .Cascade(CascadeMode.StopOnFirstFailure)
                     .Must(Have11Character)
-                    .WithMessage("Pesel must have 11 character")
+                    .WithMessage(p => $"Pesel: {p.NationalIdentificationNumber} must have 11 character")
                     .Must(HaveCorrectControlSum)
-                    .WithMessage("Pesel must have correct sum control");
+                    .WithMessage(p => $"Pesel: {p.NationalIdentificationNumber} must have correct sum control");
             }
 
             public static bool Have11Character(string pesel)
@@ -162,10 +136,8 @@ namespace CrossFinaceApp.Controlers.DebtPortfolios
 
             public static bool HaveCorrectControlSum(string pesel)
             {
-                var multipliers = new int[] { 1, 3, 7, 9, 1, 3, 7, 9, 1, 3 };
-
                 var sum = 0;
-                for (int i = 0; i < multipliers.Length; i++)
+                for (var i = 0; i < multipliers.Length; ++i)
                 {
                     sum += multipliers[i] * int.Parse(pesel[i].ToString());
                 }
@@ -185,26 +157,20 @@ namespace CrossFinaceApp.Controlers.DebtPortfolios
         public class SendDataToServiceHandler : IRequestHandler<SendDataToService, Result>
         {
             private DataContext _dataContext;
+            private ImportService.IImportService _importService;
 
-            public SendDataToServiceHandler(DataContext dataContext)
+            public SendDataToServiceHandler(DataContext dataContext,
+                ImportService.IImportService importService)
             {
                 _dataContext = dataContext;
+                _importService = importService;
             }
 
             public async Task<Result> Handle(SendDataToService request, CancellationToken cancellationToken)
             {
-                var importServiceClient = new ImportService.ImportServiceClient();
-
                 foreach (var person in await _dataContext.People.ToListAsync())
                 {
-                    var address = new ImportService.Address
-                    {
-                        City = person.Address.PostOfficeCity,
-                        HouseNo = person.Address.StreetNumber,
-                        LocaleNo = person.Address.FlatNumber,
-                        PostalCode = person.Address.PostCode,
-                        Street = person.Address.StreetName
-                    };
+                    var address = person.Address.Adapt<ImportService.Address>();
 
                     var correspondenceAddress = new ImportService.Address
                     {
@@ -216,30 +182,18 @@ namespace CrossFinaceApp.Controlers.DebtPortfolios
                     };
 
                     var finacialState = person.Agreements.FirstOrDefault(x => x.PersonId == person.Id).FinancialState;
+                    var importSeriveFinacialState = finacialState.Adapt<ImportService.FinancialState>();
 
-                    var importSeriveFinacialState = new ImportService.FinancialState
-                    {
-                        Capital = finacialState.OutstandingLiabilites,
-                        CourtFees = finacialState.CourtFees,
-                        CourtRepresentationFees = finacialState.RepresentationCourtFees,
-                        Fees = finacialState.Fees,
-                        Interest = finacialState.Interests,
-                        PenaltyInterest = finacialState.PenaltyInterests
-                    };
+                    var agreements = person.Agreements.FirstOrDefault(x => x.PersonId == person.Id)
+                        .Adapt<ImportService.IdentityDocument>();
 
-                    var agreementsNumber = person.Agreements.FirstOrDefault(x => x.PersonId == person.Id).Number;
+                    var importServicePerson = person.BuildAdapter()
+                        .AddParameters("Addresses", new ImportService.Address[] { address, correspondenceAddress})
+                        .AddParameters("FinancialState", importSeriveFinacialState)
+                        .AddParameters("IdentitiDocuments", new ImportService.IdentityDocument[] { agreements })
+                        .AdaptToType<ImportService.Person>();
 
-                    var importServicePerson = new ImportService.Person
-                    {
-                        Name = person.FirstName,
-                        Surname = person.Surname,
-                        NationalIdentificationNumber = person.NationalIdentificationNumber,
-                        Addresses = new ImportService.Address[] { address, correspondenceAddress },
-                        FinancialState = importSeriveFinacialState,
-                        IdentityDocuments = new ImportService.IdentityDocument[] { new ImportService.IdentityDocument { Number = agreementsNumber } }
-                    };
-
-                    //await importServiceClient.DoImportAsync(importServicePerson);
+                    await _importService.DoImportAsync(importServicePerson);
                 }
 
                 return Result.Ok();
